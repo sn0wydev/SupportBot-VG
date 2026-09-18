@@ -1,0 +1,13 @@
+{
+    "name": "support-ticket-bot",
+    "version": "1.0.0",
+    "description": "Anonymous Telegram support bot using forum topics as tickets",
+    "main": "bot.js",
+    "scripts": {
+        "start": "node bot.js"
+    },
+    "dependencies": {
+        "dotenv": "^16.6.1",
+        "grammy": "^1.46.0"
+    }
+}
