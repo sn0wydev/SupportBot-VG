@@ -94,6 +94,17 @@ async function adminGet(pathname) {
   return data;
 }
 
+async function adminDelete(pathname, body) {
+  const res = await fetch(`${PRIZE_STORE_URL}${pathname}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json', 'x-admin-key': ADMIN_API_KEY },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
 // Renders a /getstats reply: balance summary + a monospace table of the
 // user's prizes, styled after the same rows the prize-store already
 // tracks (prize_id, gift_name, status, updated_at).
@@ -254,19 +265,23 @@ bot.on('message:contact', async (ctx) => {
 // A non-admin (or a non-matching /command) just falls through to next(),
 // so ordinary ticket flow is untouched.
 //
-//   /addstars <user_id> <amount>   amount may be negative to deduct
-//   /addgift  <user_id> <gift_name>
-//   /addnft   <user_id> <type>
-//   /getstats <user_id>
+//   /addstars    <user_id> <amount>   amount may be negative to deduct
+//   /removeStars <user_id>            zeroes out the user's star balance
+//   /addgift     <user_id> <gift_name>
+//   /addnft      <user_id> <type>
+//   /getstats    <user_id>            balances + full prize history
+//   /getBalance  <user_id>            coins/stars only
 //
-// All four are logged server-side in prize-store's admin_actions table
-// (admin_id, action, target_user_id, payload, created_at).
+// The write commands (addstars, removeStars, addgift, addnft) are logged
+// server-side in prize-store's admin_actions table (admin_id, action,
+// target_user_id, payload, created_at). getstats/getBalance are read-only
+// and not logged.
 // ---------------------------------------------------------------------------
 bot.on('message:text', async (ctx, next) => {
   if (ctx.chat.type !== 'private') return next();
   if (!isAdmin(ctx.from.id)) return next();
 
-  const match = ctx.message.text.match(/^\/(addstars|addnft|addgift|getstats)(?:@\w+)?(?:\s+([\s\S]+))?$/i);
+  const match = ctx.message.text.match(/^\/(addstars|removestars|addnft|addgift|getstats|getbalance)(?:@\w+)?(?:\s+([\s\S]+))?$/i);
   if (!match) return next();
 
   if (!PRIZE_STORE_URL || !ADMIN_API_KEY) {
@@ -289,6 +304,39 @@ bot.on('message:text', async (ctx, next) => {
     } catch (err) {
       console.error('getstats failed:', err.message);
       await ctx.reply(`Failed to fetch stats: ${err.message}`);
+    }
+    return;
+  }
+
+  if (cmd === 'getbalance') {
+    const targetId = argStr.split(/\s+/)[0];
+    if (!targetId || isNaN(Number(targetId))) {
+      await ctx.reply('Usage: /getBalance <user_id>');
+      return;
+    }
+    try {
+      const data = await adminGet(`/admin/users/${targetId}/balance?admin_id=${ctx.from.id}`);
+      const u = data.user || {};
+      await ctx.reply(`💰 Balance for ${targetId}\nCoins: ${u.coins ?? 0}\n⭐ Stars: ${u.stars ?? 0}`);
+    } catch (err) {
+      console.error('getbalance failed:', err.message);
+      await ctx.reply(`Failed to fetch balance: ${err.message}`);
+    }
+    return;
+  }
+
+  if (cmd === 'removestars') {
+    const targetId = argStr.split(/\s+/)[0];
+    if (!targetId || isNaN(Number(targetId))) {
+      await ctx.reply('Usage: /removeStars <user_id>');
+      return;
+    }
+    try {
+      const data = await adminDelete(`/admin/users/${targetId}/stars`, { admin_id: ctx.from.id });
+      await ctx.reply(`⭐ Removed all stars from ${targetId}. Previous balance: ${data.previous_stars}. New balance: ${data.stars}`);
+    } catch (err) {
+      console.error('removestars failed:', err.message);
+      await ctx.reply(`Failed to remove stars: ${err.message}`);
     }
     return;
   }
