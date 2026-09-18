@@ -259,11 +259,15 @@ bot.on('message:contact', async (ctx) => {
 
 // ---------------------------------------------------------------------------
 // Admin commands — ADMIN: new
-// Private-chat only, sender must be in ADMIN_IDS. Registered before the
-// catch-all relay handler below, and returns without calling next() once
-// matched, so these never get created into a ticket or relayed anywhere.
+// Works in a private DM with the bot, or anywhere inside the support group
+// (SUPPORT_GROUP_ID) — general chat or any ticket topic — so multiple staff
+// can run these while working tickets, not just in a 1:1 with the bot.
+// Sender must be in ADMIN_IDS either way. Registered before the catch-all
+// relay handler below, and returns without calling next() once matched, so
+// these never get relayed to a ticket's user or treated as a ticket message.
 // A non-admin (or a non-matching /command) just falls through to next(),
-// so ordinary ticket flow is untouched.
+// so ordinary ticket flow — including staff replies and /close — is
+// untouched.
 //
 //   /addstars    <user_id> <amount>   amount may be negative to deduct
 //   /removeStars <user_id>            zeroes out the user's star balance
@@ -277,15 +281,24 @@ bot.on('message:contact', async (ctx) => {
 // target_user_id, payload, created_at). getstats/getBalance are read-only
 // and not logged.
 // ---------------------------------------------------------------------------
+
+// Replies in the same topic/thread the command was typed in, so running a
+// command inside a ticket topic doesn't dump the reply into "General".
+function adminReply(ctx, text, extra = {}) {
+  const threadId = ctx.message.message_thread_id;
+  return ctx.reply(text, threadId ? { ...extra, message_thread_id: threadId } : extra);
+}
+
 bot.on('message:text', async (ctx, next) => {
-  if (ctx.chat.type !== 'private') return next();
+  const inSupportGroup = ctx.chat.id === SUPPORT_GROUP_ID;
+  if (ctx.chat.type !== 'private' && !inSupportGroup) return next();
   if (!isAdmin(ctx.from.id)) return next();
 
   const match = ctx.message.text.match(/^\/(addstars|removestars|addnft|addgift|getstats|getbalance)(?:@\w+)?(?:\s+([\s\S]+))?$/i);
   if (!match) return next();
 
   if (!PRIZE_STORE_URL || !ADMIN_API_KEY) {
-    await ctx.reply('Admin commands are not configured — missing PRIZE_STORE_URL / ADMIN_API_KEY.');
+    await adminReply(ctx, 'Admin commands are not configured — missing PRIZE_STORE_URL / ADMIN_API_KEY.');
     return;
   }
 
@@ -295,15 +308,15 @@ bot.on('message:text', async (ctx, next) => {
   if (cmd === 'getstats') {
     const targetId = argStr.split(/\s+/)[0];
     if (!targetId || isNaN(Number(targetId))) {
-      await ctx.reply('Usage: /getstats <user_id>');
+      await adminReply(ctx, 'Usage: /getstats <user_id>');
       return;
     }
     try {
       const data = await adminGet(`/admin/users/${targetId}/stats?admin_id=${ctx.from.id}`);
-      await ctx.reply(formatStats(targetId, data), { parse_mode: 'HTML' });
+      await adminReply(ctx, formatStats(targetId, data), { parse_mode: 'HTML' });
     } catch (err) {
       console.error('getstats failed:', err.message);
-      await ctx.reply(`Failed to fetch stats: ${err.message}`);
+      await adminReply(ctx, `Failed to fetch stats: ${err.message}`);
     }
     return;
   }
@@ -311,16 +324,16 @@ bot.on('message:text', async (ctx, next) => {
   if (cmd === 'getbalance') {
     const targetId = argStr.split(/\s+/)[0];
     if (!targetId || isNaN(Number(targetId))) {
-      await ctx.reply('Usage: /getBalance <user_id>');
+      await adminReply(ctx, 'Usage: /getBalance <user_id>');
       return;
     }
     try {
       const data = await adminGet(`/admin/users/${targetId}/balance?admin_id=${ctx.from.id}`);
       const u = data.user || {};
-      await ctx.reply(`💰 Balance for ${targetId}\nCoins: ${u.coins ?? 0}\n⭐ Stars: ${u.stars ?? 0}`);
+      await adminReply(ctx, `💰 Balance for ${targetId}\nCoins: ${u.coins ?? 0}\n⭐ Stars: ${u.stars ?? 0}`);
     } catch (err) {
       console.error('getbalance failed:', err.message);
-      await ctx.reply(`Failed to fetch balance: ${err.message}`);
+      await adminReply(ctx, `Failed to fetch balance: ${err.message}`);
     }
     return;
   }
@@ -328,15 +341,15 @@ bot.on('message:text', async (ctx, next) => {
   if (cmd === 'removestars') {
     const targetId = argStr.split(/\s+/)[0];
     if (!targetId || isNaN(Number(targetId))) {
-      await ctx.reply('Usage: /removeStars <user_id>');
+      await adminReply(ctx, 'Usage: /removeStars <user_id>');
       return;
     }
     try {
       const data = await adminDelete(`/admin/users/${targetId}/stars`, { admin_id: ctx.from.id });
-      await ctx.reply(`⭐ Removed all stars from ${targetId}. Previous balance: ${data.previous_stars}. New balance: ${data.stars}`);
+      await adminReply(ctx, `⭐ Removed all stars from ${targetId}. Previous balance: ${data.previous_stars}. New balance: ${data.stars}`);
     } catch (err) {
       console.error('removestars failed:', err.message);
-      await ctx.reply(`Failed to remove stars: ${err.message}`);
+      await adminReply(ctx, `Failed to remove stars: ${err.message}`);
     }
     return;
   }
@@ -345,15 +358,15 @@ bot.on('message:text', async (ctx, next) => {
     const [targetId, amountStr] = argStr.split(/\s+/);
     const amount = parseInt(amountStr, 10);
     if (!targetId || isNaN(Number(targetId)) || !Number.isFinite(amount) || amount === 0) {
-      await ctx.reply('Usage: /addstars <user_id> <amount>  (amount can be negative)');
+      await adminReply(ctx, 'Usage: /addstars <user_id> <amount>  (amount can be negative)');
       return;
     }
     try {
       const data = await adminPost(`/admin/users/${targetId}/stars`, { amount, admin_id: ctx.from.id });
-      await ctx.reply(`⭐ ${amount > 0 ? 'Added' : 'Removed'} ${Math.abs(amount)} star(s) for ${targetId}. New balance: ${data.stars}`);
+      await adminReply(ctx, `⭐ ${amount > 0 ? 'Added' : 'Removed'} ${Math.abs(amount)} star(s) for ${targetId}. New balance: ${data.stars}`);
     } catch (err) {
       console.error('addstars failed:', err.message);
-      await ctx.reply(`Failed to add stars: ${err.message}`);
+      await adminReply(ctx, `Failed to add stars: ${err.message}`);
     }
     return;
   }
@@ -363,15 +376,15 @@ bot.on('message:text', async (ctx, next) => {
     const targetId = parts[0];
     const giftName = parts.slice(1).join(' ').trim();
     if (!targetId || isNaN(Number(targetId)) || !giftName) {
-      await ctx.reply('Usage: /addgift <user_id> <gift_name>');
+      await adminReply(ctx, 'Usage: /addgift <user_id> <gift_name>');
       return;
     }
     try {
       const data = await adminPost('/admin/gifts', { user_id: targetId, gift_name: giftName, admin_id: ctx.from.id });
-      await ctx.reply(`🎁 Added "${giftName}" to ${targetId}'s inventory. Prize ID: ${data.prize.prize_id}`);
+      await adminReply(ctx, `🎁 Added "${giftName}" to ${targetId}'s inventory. Prize ID: ${data.prize.prize_id}`);
     } catch (err) {
       console.error('addgift failed:', err.message);
-      await ctx.reply(`Failed to add gift: ${err.message}`);
+      await adminReply(ctx, `Failed to add gift: ${err.message}`);
     }
     return;
   }
@@ -381,7 +394,7 @@ bot.on('message:text', async (ctx, next) => {
     const targetId = parts[0];
     const nftType = parts.slice(1).join(' ').trim();
     if (!targetId || isNaN(Number(targetId)) || !nftType) {
-      await ctx.reply('Usage: /addnft <user_id> <type>');
+      await adminReply(ctx, 'Usage: /addnft <user_id> <type>');
       return;
     }
     try {
