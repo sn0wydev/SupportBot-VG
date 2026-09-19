@@ -35,6 +35,36 @@ if (!PRIZE_STORE_URL || !ADMIN_API_KEY) {
   console.warn('⚠️  PRIZE_STORE_URL / ADMIN_API_KEY not set — admin commands will fail if anyone tries them.');
 }
 
+// ---------------------------------------------------------------------------
+// Manager config — new
+// Manager sits above admin: only manager IDs can run /pushAnnounce, which
+// broadcasts to every user who has ever pressed /start on the *main* bot.
+// Kept as its own env var/set rather than reusing ADMIN_IDS on purpose —
+// admin access (stars/gifts/nft) and broadcast access are different blast
+// radii, and adding someone to one shouldn't silently hand them the other.
+//
+// PUSH_BRIDGE_URL / PUSH_BRIDGE_SECRET: how this process reaches the main
+// bot's /push-announce endpoint (see messageHandlers.js). Same
+// shared-secret pattern as ADMIN_API_KEY above — PUSH_BRIDGE_SECRET must
+// match the value the main bot process was given.
+// ---------------------------------------------------------------------------
+const MANAGER_IDS = new Set(
+  (process.env.MANAGER_IDS || '').split(',').map((s) => s.trim()).filter(Boolean)
+);
+const PUSH_BRIDGE_URL = process.env.PUSH_BRIDGE_URL;
+const PUSH_BRIDGE_SECRET = process.env.PUSH_BRIDGE_SECRET;
+
+if (MANAGER_IDS.size === 0) {
+  console.warn('⚠️  MANAGER_IDS not set — /pushAnnounce is disabled for everyone.');
+}
+if (!PUSH_BRIDGE_URL || !PUSH_BRIDGE_SECRET) {
+  console.warn('⚠️  PUSH_BRIDGE_URL / PUSH_BRIDGE_SECRET not set — /pushAnnounce will fail if anyone tries it.');
+}
+
+function isManager(userId) {
+  return MANAGER_IDS.has(String(userId));
+}
+
 const bot = new Bot(BOT_TOKEN);
 
 // ---------------------------------------------------------------------------
@@ -416,6 +446,84 @@ bot.on('message:text', async (ctx, next) => {
       await ctx.reply(`Failed to add NFT: ${err.message}`);
     }
     return;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// /pushAnnounce — manager-only global broadcast — new
+//
+//   /pushAnnounce <message>              text-only broadcast
+//   (send a photo, caption it "/pushAnnounce <message>")  photo broadcast
+//
+// grammy matches commands inside photo captions the same way it matches
+// plain command text, and ctx.match is everything after the command with
+// the command itself already stripped — that's the "copy everything
+// excluding the command" part, for both the text and photo case.
+//
+// This is a bot.command() registration, so — like the admin block above —
+// it runs and terminates before the catch-all relay handler further down;
+// a non-manager just gets a rejection reply and nothing gets forwarded
+// anywhere.
+// ---------------------------------------------------------------------------
+bot.command('pushAnnounce', async (ctx) => {
+  if (!isManager(ctx.from.id)) {
+    await ctx.reply('🚫 Managers only.');
+    return;
+  }
+
+  if (!PUSH_BRIDGE_URL || !PUSH_BRIDGE_SECRET) {
+    await ctx.reply('Broadcast bridge is not configured — missing PUSH_BRIDGE_URL / PUSH_BRIDGE_SECRET.');
+    return;
+  }
+
+  const text = (ctx.match || '').trim();
+  const photo = ctx.message.photo;
+
+  if (!text && !photo) {
+    await ctx.reply('Usage: /pushAnnounce <message>  (optionally attach a photo — caption = command + text)');
+    return;
+  }
+
+  let photoBase64 = null;
+  let photoMime = null;
+
+  if (photo) {
+    try {
+      // Telegram's `photo` array is sorted smallest -> largest; last entry
+      // is the highest resolution version.
+      const fileId = photo[photo.length - 1].file_id;
+      const file = await ctx.api.getFile(fileId);
+      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+      const resp = await fetch(fileUrl);
+      if (!resp.ok) throw new Error(`Telegram file download failed: HTTP ${resp.status}`);
+      const arrayBuffer = await resp.arrayBuffer();
+      photoBase64 = Buffer.from(arrayBuffer).toString('base64');
+      photoMime = 'image/jpeg'; // Telegram re-encodes photos to jpeg server-side
+    } catch (err) {
+      console.error('pushAnnounce: failed to fetch photo:', err.message);
+      await ctx.reply(`Failed to fetch the photo from Telegram: ${err.message}`);
+      return;
+    }
+  }
+
+  await ctx.reply('📣 Broadcasting…');
+
+  try {
+    const resp = await fetch(PUSH_BRIDGE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-push-secret': PUSH_BRIDGE_SECRET },
+      body: JSON.stringify({ managerId: ctx.from.id, text, photoBase64, photoMime }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.ok) {
+      throw new Error(data.error || `HTTP ${resp.status}`);
+    }
+    await ctx.reply(
+      `✅ Sent to ${data.sent}/${data.total} users. (${data.blocked} blocked the bot, ${data.failed} failed.)`
+    );
+  } catch (err) {
+    console.error('pushAnnounce: bridge request failed:', err.message);
+    await ctx.reply(`Broadcast failed: ${err.message}`);
   }
 });
 
