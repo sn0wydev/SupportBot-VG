@@ -61,6 +61,9 @@ if (!PUSH_BRIDGE_URL || !PUSH_BRIDGE_SECRET) {
   console.warn('⚠️  PUSH_BRIDGE_URL / PUSH_BRIDGE_SECRET not set — /pushAnnounce will fail if anyone tries it.');
 }
 
+console.log('[boot] PUSH_BRIDGE_URL:', JSON.stringify(PUSH_BRIDGE_URL));
+console.log('[boot] PUSH_BRIDGE_SECRET set:', !!PUSH_BRIDGE_SECRET, 'len:', (PUSH_BRIDGE_SECRET || '').length);
+
 function isManager(userId) {
   return MANAGER_IDS.has(String(userId));
 }
