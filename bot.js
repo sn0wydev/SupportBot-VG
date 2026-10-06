@@ -3,144 +3,383 @@ const fs = require('fs');
 const path = require('path');
 const { Bot, InlineKeyboard, Keyboard } = require('grammy');
 
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPPORT_GROUP_ID = Number(process.env.SUPPORT_GROUP_ID); // e.g. -1001234567890
 const DEV_COMMAND = 'cn34711'; // hidden alternate trigger, not registered with BotFather
-const DB_PATH = path.join(__dirname, 'tickets.json');
+
+// IMPORTANT (Railway): the container filesystem is wiped on every deploy.
+// Attach a Volume (e.g. mount path /data) and set DATA_DIR=/data, otherwise
+// every ticket is forgotten on each redeploy.
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const DB_PATH = path.join(DATA_DIR, 'tickets.json');
 
 if (!BOT_TOKEN || !SUPPORT_GROUP_ID) {
-  console.error('Missing BOT_TOKEN or SUPPORT_GROUP_ID — check your .env file.');
+  console.error('Missing BOT_TOKEN or SUPPORT_GROUP_ID — check your environment variables.');
   process.exit(1);
 }
 
-// ---------------------------------------------------------------------------
-// Admin config — ADMIN: new
-// ADMIN_IDS: comma-separated Telegram user IDs allowed to run /addstars,
-// /addnft, /addgift, /getstats (e.g. "111111,222222").
-// PRIZE_STORE_URL / ADMIN_API_KEY: how the bot reaches the prize-store's
-// admin-only endpoints. ADMIN_API_KEY must match the same env var set on
-// the prize-store service — it's the shared secret gating those routes,
-// since prize-store's public endpoints have no auth at all right now.
-// ---------------------------------------------------------------------------
-const ADMIN_IDS = new Set(
-  (process.env.ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean)
-);
+const parseIdSet = (v) => new Set((v || '').split(',').map((s) => s.trim()).filter(Boolean));
+
+const ADMIN_IDS = parseIdSet(process.env.ADMIN_IDS);
 const PRIZE_STORE_URL = (process.env.PRIZE_STORE_URL || '').replace(/\/$/, '');
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 
-if (ADMIN_IDS.size === 0) {
-  console.warn('⚠️  ADMIN_IDS not set — /addstars, /addnft, /addgift, /getstats are disabled for everyone.');
-}
-if (!PRIZE_STORE_URL || !ADMIN_API_KEY) {
-  console.warn('⚠️  PRIZE_STORE_URL / ADMIN_API_KEY not set — admin commands will fail if anyone tries them.');
-}
-
-// ---------------------------------------------------------------------------
-// Manager config — new
-// Manager sits above admin: only manager IDs can run /pushAnnounce, which
-// broadcasts to every user who has ever pressed /start on the *main* bot.
-// Kept as its own env var/set rather than reusing ADMIN_IDS on purpose —
-// admin access (stars/gifts/nft) and broadcast access are different blast
-// radii, and adding someone to one shouldn't silently hand them the other.
-//
-// PUSH_BRIDGE_URL / PUSH_BRIDGE_SECRET: how this process reaches the main
-// bot's /push-announce endpoint (see messageHandlers.js). Same
-// shared-secret pattern as ADMIN_API_KEY above — PUSH_BRIDGE_SECRET must
-// match the value the main bot process was given.
-// ---------------------------------------------------------------------------
-const MANAGER_IDS = new Set(
-  (process.env.MANAGER_IDS || '').split(',').map((s) => s.trim()).filter(Boolean)
-);
+const MANAGER_IDS = parseIdSet(process.env.MANAGER_IDS);
 const PUSH_BRIDGE_URL = process.env.PUSH_BRIDGE_URL;
 const PUSH_BRIDGE_SECRET = process.env.PUSH_BRIDGE_SECRET;
 
-if (MANAGER_IDS.size === 0) {
-  console.warn('⚠️  MANAGER_IDS not set — /pushAnnounce is disabled for everyone.');
-}
-if (!PUSH_BRIDGE_URL || !PUSH_BRIDGE_SECRET) {
-  console.warn('⚠️  PUSH_BRIDGE_URL / PUSH_BRIDGE_SECRET not set — /pushAnnounce will fail if anyone tries it.');
-}
+if (ADMIN_IDS.size === 0) console.warn('⚠️  ADMIN_IDS not set — admin commands are disabled for everyone.');
+if (!PRIZE_STORE_URL || !ADMIN_API_KEY) console.warn('⚠️  PRIZE_STORE_URL / ADMIN_API_KEY not set — admin commands will fail.');
+if (MANAGER_IDS.size === 0) console.warn('⚠️  MANAGER_IDS not set — /pushAnnounce is disabled for everyone.');
+if (!PUSH_BRIDGE_URL || !PUSH_BRIDGE_SECRET) console.warn('⚠️  PUSH_BRIDGE_URL / PUSH_BRIDGE_SECRET not set — /pushAnnounce will fail.');
 
-console.log('[boot] PUSH_BRIDGE_URL:', JSON.stringify(PUSH_BRIDGE_URL));
-console.log('[boot] PUSH_BRIDGE_SECRET set:', !!PUSH_BRIDGE_SECRET, 'len:', (PUSH_BRIDGE_SECRET || '').length);
-
-function isManager(userId) {
-  return MANAGER_IDS.has(String(userId));
-}
+const isAdmin = (id) => ADMIN_IDS.has(String(id));
+const isManager = (id) => MANAGER_IDS.has(String(id));
+const isId = (s) => /^\d{1,15}$/.test(String(s || ''));
 
 const bot = new Bot(BOT_TOKEN);
 
 // ---------------------------------------------------------------------------
-// Tiny JSON-file "database". Fine for low/medium volume; swap for SQLite or
-// Postgres if ticket volume grows or you need multiple bot instances.
+// Storage
+//
+// Old format kept two separate copies of every ticket (byUser / byTopic).
+// After a restart those copies were no longer the same object, so /close
+// updated one copy but not the other — the user kept writing into a closed
+// topic. New format: ONE record per ticket, plus two index maps that only
+// store ticket numbers.
+//
+//   { nextTicketNumber, tickets: {num: ticket}, byUser: {userId: num}, byTopic: {topicId: num} }
 // ---------------------------------------------------------------------------
-function loadDB() {
-  if (!fs.existsSync(DB_PATH)) {
-    return { nextTicketNumber: 1, byUser: {}, byTopic: {} };
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function emptyDB() {
+  return { nextTicketNumber: 1, tickets: {}, byUser: {}, byTopic: {} };
+}
+
+function migrate(raw) {
+  if (raw && raw.tickets) {
+    return { ...emptyDB(), ...raw };
   }
-  return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+  // Legacy format -> new format
+  const db = emptyDB();
+  db.nextTicketNumber = (raw && raw.nextTicketNumber) || 1;
+  const legacy = [...Object.values((raw && raw.byUser) || {}), ...Object.values((raw && raw.byTopic) || {})];
+  for (const t of legacy) {
+    const prev = db.tickets[t.ticketNumber];
+    db.tickets[t.ticketNumber] = prev
+      ? { ...prev, ...t, closed: Boolean(prev.closed || t.closed), phone: t.phone || prev.phone || null }
+      : { ...t };
+  }
+  const nums = Object.keys(db.tickets).map(Number).sort((a, b) => a - b);
+  for (const n of nums) {
+    const t = db.tickets[n];
+    db.byTopic[t.topicId] = n;
+    db.byUser[t.userId] = n; // ascending order -> newest ticket wins
+    if (n >= db.nextTicketNumber) db.nextTicketNumber = n + 1;
+  }
+  return db;
 }
-function saveDB() {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+
+function loadDB() {
+  for (const p of [DB_PATH, `${DB_PATH}.bak`]) {
+    if (!fs.existsSync(p)) continue;
+    try {
+      const db = migrate(JSON.parse(fs.readFileSync(p, 'utf8')));
+      console.log(`[db] loaded ${Object.keys(db.tickets).length} ticket(s) from ${p}`);
+      return db;
+    } catch (err) {
+      console.error(`[db] could not read ${p}:`, err.message);
+    }
+  }
+  console.warn(`[db] no database found at ${DB_PATH} — starting EMPTY. If you expected existing tickets, your volume / DATA_DIR is not set up correctly.`);
+  return emptyDB();
 }
+
 const db = loadDB();
+
+// Atomic write: a crash mid-save can no longer corrupt tickets.json.
+function saveDB() {
+  const tmp = `${DB_PATH}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
+  if (fs.existsSync(DB_PATH)) fs.copyFileSync(DB_PATH, `${DB_PATH}.bak`);
+  fs.renameSync(tmp, DB_PATH);
+}
+
+const ticketByTopic = (topicId) => db.tickets[db.byTopic[topicId]] || null;
+const latestTicketFor = (userId) => db.tickets[db.byUser[userId]] || null;
+const openTicketFor = (userId) => {
+  const t = latestTicketFor(userId);
+  return t && !t.closed ? t : null;
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-function userLink(user) {
-  return user.username ? `https://t.me/${user.username}` : `tg://user?id=${user.id}`;
+const userLink = (u) => (u.username ? `https://t.me/${u.username}` : `tg://user?id=${u.id}`);
+const escapeHtml = (s = '') => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const fullName = (u) => `${u.first_name || ''} ${u.last_name || ''}`.trim() || '—';
+const errText = (err) => err?.description || err?.message || String(err);
+
+// Replies inside the same topic the command was typed in.
+function replyInTopic(ctx, text, extra = {}) {
+  const threadId = ctx.message?.message_thread_id;
+  return ctx.reply(text, threadId ? { ...extra, message_thread_id: threadId } : extra);
 }
 
-function escapeHtml(s = '') {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// Only real content can be copied. Service messages ("topic closed", "pinned",
+// "user joined"…) cause "the message can't be copied", so we whitelist instead.
+const RELAYABLE = ['text', 'photo', 'video', 'document', 'audio', 'voice', 'video_note', 'animation', 'sticker', 'location', 'venue', 'contact', 'dice', 'poll'];
+const isRelayable = (m) => RELAYABLE.some((k) => m[k] !== undefined);
+
+const TOPIC_GONE = /thread not found|TOPIC_DELETED|TOPIC_CLOSED|topic.*(deleted|closed)/i;
+
+// ---------------------------------------------------------------------------
+// Tickets
+// ---------------------------------------------------------------------------
+async function sendInfoCard(ticket, user) {
+  const card = [
+    `🎫 <b>Ticket #${ticket.ticketNumber}</b>`,
+    `👤 Name: ${escapeHtml(fullName(user))}`,
+    `🔗 Username: ${user.username ? '@' + escapeHtml(user.username) : '—'}`,
+    `🆔 ID: <code>${user.id}</code>`,
+    `📞 Phone (optional): ${ticket.phone ? escapeHtml(ticket.phone) : 'not shared'}`,
+    `💬 Contact: <a href="${userLink(user)}">open chat</a>`,
+  ].join('\n');
+
+  await bot.api.sendMessage(SUPPORT_GROUP_ID, card, {
+    message_thread_id: ticket.topicId,
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+  });
 }
 
-function fullName(user) {
-  return `${user.first_name || ''} ${user.last_name || ''}`.trim() || '—';
+async function createTicket(user) {
+  const prev = latestTicketFor(user.id);
+  const ticketNumber = db.nextTicketNumber;
+  const title = `#${ticketNumber} · ${fullName(user)}`.slice(0, 128);
+
+  const topic = await bot.api.createForumTopic(SUPPORT_GROUP_ID, title);
+
+  // Only consume the number once Telegram confirmed the topic exists.
+  db.nextTicketNumber = ticketNumber + 1;
+  const ticket = {
+    ticketNumber,
+    topicId: topic.message_thread_id,
+    userId: user.id,
+    closed: false,
+    phone: prev?.phone || null,
+    createdAt: Date.now(),
+  };
+  db.tickets[ticketNumber] = ticket;
+  db.byUser[user.id] = ticketNumber;
+  db.byTopic[ticket.topicId] = ticketNumber;
+  saveDB();
+
+  // The ticket already exists; a failing info card must not lose it.
+  await sendInfoCard(ticket, user).catch((err) => console.error('info card failed:', errText(err)));
+  return ticket;
+}
+
+// One ticket creation per user at a time, so two quick messages can't spawn
+// two topics.
+const creating = new Map();
+function getOrCreateTicket(user) {
+  const open = openTicketFor(user.id);
+  if (open) return Promise.resolve(open);
+  if (creating.has(user.id)) return creating.get(user.id);
+  const p = createTicket(user).finally(() => creating.delete(user.id));
+  creating.set(user.id, p);
+  return p;
+}
+
+async function closeTicket(ticket, { notifyUser = true } = {}) {
+  if (ticket.closed) return false;
+  ticket.closed = true;
+  saveDB();
+  if (notifyUser) {
+    await bot.api
+      .sendMessage(ticket.userId, 'This support ticket has been closed. Send a new message to start another.')
+      .catch(() => {});
+  }
+  return true;
+}
+
+async function startTicketFlow(chatId, user) {
+  try {
+    await getOrCreateTicket(user);
+  } catch (err) {
+    console.error('createForumTopic failed:', errText(err));
+    await bot.api.sendMessage(chatId, 'Support is temporarily unavailable, please try again shortly.').catch(() => {});
+    return;
+  }
+
+  const keyboard = new Keyboard()
+    .requestContact('📞 Share phone number (optional)')
+    .row()
+    .text('⏭ Skip')
+    .resized()
+    .oneTime();
+
+  await bot.api.sendMessage(
+    chatId,
+    "You're connected to support. Send your message and we'll reply here.\n\nSharing your phone number is optional — tap Skip if you'd rather not.",
+    { reply_markup: keyboard }
+  );
 }
 
 // ---------------------------------------------------------------------------
-// Admin helpers — ADMIN: new
+// User-facing triggers (private chats only)
 // ---------------------------------------------------------------------------
-function isAdmin(userId) {
-  return ADMIN_IDS.has(String(userId));
-}
+const isPrivate = (ctx) => ctx.chat?.type === 'private';
 
-async function adminPost(pathname, body) {
+bot.command('start', async (ctx) => {
+  if (!isPrivate(ctx)) return;
+  const keyboard = new InlineKeyboard().text('📩 Contact Support', 'open_ticket');
+  await ctx.reply('Need help? Tap below to talk to support.', { reply_markup: keyboard });
+});
+
+bot.command(DEV_COMMAND, async (ctx) => {
+  if (!isPrivate(ctx)) return;
+  await startTicketFlow(ctx.chat.id, ctx.from);
+});
+
+bot.command('createticket', async (ctx) => {
+  if (!isPrivate(ctx)) return;
+  await startTicketFlow(ctx.chat.id, ctx.from);
+});
+
+bot.callbackQuery('open_ticket', async (ctx) => {
+  await ctx.answerCallbackQuery().catch(() => {});
+  if (ctx.chat && !isPrivate(ctx)) return;
+  await startTicketFlow(ctx.from.id, ctx.from);
+});
+
+bot.hears('⏭ Skip', async (ctx) => {
+  if (!isPrivate(ctx)) return;
+  await ctx.reply('No problem — support can still reach you without a phone number.', {
+    reply_markup: { remove_keyboard: true },
+  });
+});
+
+// Phone number: only ever arrives if the user taps the share-contact button.
+bot.on('message:contact', async (ctx, next) => {
+  if (!isPrivate(ctx)) return next();
+  const ticket = openTicketFor(ctx.from.id);
+  // Someone else's contact, or no open ticket -> treat as a normal message.
+  if (!ticket || ctx.message.contact.user_id !== ctx.from.id) return next();
+
+  ticket.phone = ctx.message.contact.phone_number;
+  saveDB();
+
+  await bot.api
+    .sendMessage(SUPPORT_GROUP_ID, `📞 Phone number shared: <code>${escapeHtml(ticket.phone)}</code>`, {
+      message_thread_id: ticket.topicId,
+      parse_mode: 'HTML',
+    })
+    .catch((err) => console.error('phone notice failed:', errText(err)));
+
+  await ctx.reply('Thanks — support has your number now.', { reply_markup: { remove_keyboard: true } });
+});
+
+// ---------------------------------------------------------------------------
+// Staff commands inside the support group
+// ---------------------------------------------------------------------------
+bot.command('close', async (ctx) => {
+  if (ctx.chat.id !== SUPPORT_GROUP_ID) return;
+  const topicId = ctx.message.message_thread_id;
+  const ticket = topicId ? ticketByTopic(topicId) : null;
+  if (!ticket) {
+    await replyInTopic(ctx, "This topic isn't linked to a user. Use /link <user_id> first.");
+    return;
+  }
+  const changed = await closeTicket(ticket);
+  await bot.api.closeForumTopic(SUPPORT_GROUP_ID, ticket.topicId).catch(() => {});
+  await replyInTopic(ctx, changed ? 'Ticket closed.' : 'Ticket was already closed.');
+});
+
+// Recovery tool: re-connect a topic to a user (e.g. after the database was
+// lost). The user's ID is printed in the first message of every ticket topic.
+bot.command('link', async (ctx) => {
+  if (ctx.chat.id !== SUPPORT_GROUP_ID) return;
+  const topicId = ctx.message.message_thread_id;
+  const arg = (ctx.match || '').trim();
+  if (!topicId) {
+    await ctx.reply('Run /link <user_id> inside the ticket topic you want to reconnect.');
+    return;
+  }
+  if (!isId(arg)) {
+    await replyInTopic(ctx, 'Usage: /link <user_id>   (the ID is in the first message of this topic)');
+    return;
+  }
+  const userId = Number(arg);
+
+  let ticket = ticketByTopic(topicId);
+  if (ticket) {
+    ticket.userId = userId;
+    ticket.closed = false;
+  } else {
+    const ticketNumber = db.nextTicketNumber++;
+    ticket = { ticketNumber, topicId, userId, closed: false, phone: null, createdAt: Date.now(), relinked: true };
+    db.tickets[ticketNumber] = ticket;
+    db.byTopic[topicId] = ticketNumber;
+  }
+  db.byUser[userId] = ticket.ticketNumber;
+  saveDB();
+
+  await bot.api.reopenForumTopic(SUPPORT_GROUP_ID, topicId).catch(() => {});
+
+  let reachable = true;
+  try {
+    await bot.api.sendChatAction(userId, 'typing');
+  } catch (err) {
+    reachable = false;
+    console.warn(`/link: user ${userId} not reachable:`, errText(err));
+  }
+  await replyInTopic(
+    ctx,
+    reachable
+      ? `🔗 Linked. Messages in this topic now go to user ${userId}.`
+      : `🔗 Linked to ${userId}, but the bot can't message them right now (they may have blocked it or never started it).`
+  );
+});
+
+// Closing / reopening a topic from the Telegram UI keeps our records in sync.
+bot.on('message:forum_topic_closed', async (ctx) => {
+  if (ctx.chat.id !== SUPPORT_GROUP_ID) return;
+  const t = ticketByTopic(ctx.message.message_thread_id);
+  if (t) await closeTicket(t);
+});
+
+bot.on('message:forum_topic_reopened', async (ctx) => {
+  if (ctx.chat.id !== SUPPORT_GROUP_ID) return;
+  const t = ticketByTopic(ctx.message.message_thread_id);
+  if (!t || !t.closed) return;
+  t.closed = false;
+  const current = latestTicketFor(t.userId);
+  if (!current || current.closed || current.ticketNumber === t.ticketNumber) {
+    db.byUser[t.userId] = t.ticketNumber;
+  }
+  saveDB();
+});
+
+// ---------------------------------------------------------------------------
+// Admin commands (prize-store)
+// ---------------------------------------------------------------------------
+async function adminRequest(method, pathname, body) {
   const res = await fetch(`${PRIZE_STORE_URL}${pathname}`, {
-    method: 'POST',
+    method,
     headers: { 'Content-Type': 'application/json', 'x-admin-key': ADMIN_API_KEY },
-    body: JSON.stringify(body),
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(15000),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
 
-async function adminGet(pathname) {
-  const res = await fetch(`${PRIZE_STORE_URL}${pathname}`, {
-    headers: { 'x-admin-key': ADMIN_API_KEY },
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-  return data;
-}
-
-async function adminDelete(pathname, body) {
-  const res = await fetch(`${PRIZE_STORE_URL}${pathname}`, {
-    method: 'DELETE',
-    headers: { 'Content-Type': 'application/json', 'x-admin-key': ADMIN_API_KEY },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-  return data;
-}
-
-// Renders a /getstats reply: balance summary + a monospace table of the
-// user's prizes, styled after the same rows the prize-store already
-// tracks (prize_id, gift_name, status, updated_at).
 function formatStats(userId, data) {
   const u = data.user || {};
   const prizes = data.prizes || [];
@@ -174,152 +413,7 @@ function formatStats(userId, data) {
 
   lines.push(`<pre>${escapeHtml(`${header}\n${sep}\n${body}`)}</pre>`);
   if (prizes.length > shown.length) lines.push(`…and ${prizes.length - shown.length} more.`);
-
   return lines.join('\n');
-}
-
-async function getOrCreateTicket(user) {
-  const existing = db.byUser[user.id];
-  if (existing && !existing.closed) return existing;
-
-  const ticketNumber = db.nextTicketNumber++;
-  const title = `#${ticketNumber} · ${fullName(user)}`.slice(0, 128);
-
-  const topic = await bot.api.createForumTopic(SUPPORT_GROUP_ID, title);
-
-  const ticket = {
-    ticketNumber,
-    topicId: topic.message_thread_id,
-    userId: user.id,
-    closed: false,
-    phone: existing?.phone || null,
-  };
-  db.byUser[user.id] = ticket;
-  db.byTopic[ticket.topicId] = ticket;
-  saveDB();
-
-  const infoCard = [
-    `🎫 <b>Ticket #${ticketNumber}</b>`,
-    `👤 Name: ${escapeHtml(fullName(user))}`,
-    `🔗 Username: ${user.username ? '@' + user.username : '—'}`,
-    `🆔 ID: <code>${user.id}</code>`,
-    `📞 Phone (optional): ${ticket.phone ? escapeHtml(ticket.phone) : 'not shared'}`,
-    `💬 Contact: <a href="${userLink(user)}">open chat</a>`,
-  ].join('\n');
-
-  await bot.api.sendMessage(SUPPORT_GROUP_ID, infoCard, {
-    message_thread_id: ticket.topicId,
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-  });
-
-  return ticket;
-}
-
-async function startTicketFlow(chatId, user) {
-  try {
-    await getOrCreateTicket(user);
-  } catch (err) {
-    console.error('createForumTopic failed:', err.description || err.message);
-    await bot.api.sendMessage(chatId, 'Support is temporarily unavailable, please try again shortly.');
-    return;
-  }
-
-  const keyboard = new Keyboard()
-    .requestContact('📞 Share phone number (optional)')
-    .row()
-    .text('⏭ Skip')
-    .resized()
-    .oneTime();
-
-  await bot.api.sendMessage(
-    chatId,
-    "You're connected to support. Send your message and we'll reply here.\n\nSharing your phone number is optional — tap Skip if you'd rather not.",
-    { reply_markup: keyboard }
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Triggers: /start button, hidden dev command, inline button callback
-// ---------------------------------------------------------------------------
-bot.command('start', async (ctx) => {
-  const keyboard = new InlineKeyboard().text('📩 Contact Support', 'open_ticket');
-  await ctx.reply('Need help? Tap below to talk to support.', { reply_markup: keyboard });
-});
-
-bot.command(DEV_COMMAND, async (ctx) => {
-  await startTicketFlow(ctx.chat.id, ctx.from);
-});
-
-// Public alias for starting a ticket directly, without going through /start's button.
-bot.command('createticket', async (ctx) => {
-  await startTicketFlow(ctx.chat.id, ctx.from);
-});
-
-bot.callbackQuery('open_ticket', async (ctx) => {
-  await startTicketFlow(ctx.chat.id, ctx.from);
-  await ctx.answerCallbackQuery().catch(() => {});
-});
-
-// User tapped "Skip" instead of sharing their phone number — just dismiss
-// the keyboard, don't relay "⏭ Skip" into the topic as a real message.
-bot.hears('⏭ Skip', async (ctx) => {
-  if (ctx.chat.type !== 'private') return;
-  await ctx.reply('No problem — support can still reach you without a phone number.', {
-    reply_markup: { remove_keyboard: true },
-  });
-});
-
-// Phone number: only ever arrives if the user taps the share-contact button.
-// The Bot API never exposes a phone number without that explicit action.
-bot.on('message:contact', async (ctx) => {
-  if (ctx.chat.type !== 'private') return;
-  const ticket = db.byUser[ctx.from.id];
-  if (!ticket || ctx.message.contact.user_id !== ctx.from.id) return; // ignore forwarded contacts of others
-
-  ticket.phone = ctx.message.contact.phone_number;
-  saveDB();
-
-  await bot.api.sendMessage(
-    SUPPORT_GROUP_ID,
-    `📞 Phone number shared: <code>${escapeHtml(ticket.phone)}</code>`,
-    { message_thread_id: ticket.topicId, parse_mode: 'HTML' }
-  );
-  await ctx.reply('Thanks — support has your number now.', {
-    reply_markup: { remove_keyboard: true },
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Admin commands — ADMIN: new
-// Works in a private DM with the bot, or anywhere inside the support group
-// (SUPPORT_GROUP_ID) — general chat or any ticket topic — so multiple staff
-// can run these while working tickets, not just in a 1:1 with the bot.
-// Sender must be in ADMIN_IDS either way. Registered before the catch-all
-// relay handler below, and returns without calling next() once matched, so
-// these never get relayed to a ticket's user or treated as a ticket message.
-// A non-admin (or a non-matching /command) just falls through to next(),
-// so ordinary ticket flow — including staff replies and /close — is
-// untouched.
-//
-//   /addstars    <user_id> <amount>   amount may be negative to deduct
-//   /removeStars <user_id>            zeroes out the user's star balance
-//   /addgift     <user_id> <gift_name>
-//   /addnft      <user_id> <type>
-//   /getstats    <user_id>            balances + full prize history
-//   /getBalance  <user_id>            coins/stars only
-//
-// The write commands (addstars, removeStars, addgift, addnft) are logged
-// server-side in prize-store's admin_actions table (admin_id, action,
-// target_user_id, payload, created_at). getstats/getBalance are read-only
-// and not logged.
-// ---------------------------------------------------------------------------
-
-// Replies in the same topic/thread the command was typed in, so running a
-// command inside a ticket topic doesn't dump the reply into "General".
-function adminReply(ctx, text, extra = {}) {
-  const threadId = ctx.message.message_thread_id;
-  return ctx.reply(text, threadId ? { ...extra, message_thread_id: threadId } : extra);
 }
 
 bot.on('message:text', async (ctx, next) => {
@@ -331,151 +425,86 @@ bot.on('message:text', async (ctx, next) => {
   if (!match) return next();
 
   if (!PRIZE_STORE_URL || !ADMIN_API_KEY) {
-    await adminReply(ctx, 'Admin commands are not configured — missing PRIZE_STORE_URL / ADMIN_API_KEY.');
+    await replyInTopic(ctx, 'Admin commands are not configured — missing PRIZE_STORE_URL / ADMIN_API_KEY.');
     return;
   }
 
   const cmd = match[1].toLowerCase();
   const argStr = (match[2] || '').trim();
+  const parts = argStr.split(/\s+/);
+  const targetId = parts[0];
+  const rest = parts.slice(1).join(' ').trim();
+  const adminId = ctx.from.id;
 
-  if (cmd === 'getstats') {
-    const targetId = argStr.split(/\s+/)[0];
-    if (!targetId || isNaN(Number(targetId))) {
-      await adminReply(ctx, 'Usage: /getstats <user_id>');
-      return;
-    }
-    try {
-      const data = await adminGet(`/admin/users/${targetId}/stats?admin_id=${ctx.from.id}`);
-      await adminReply(ctx, formatStats(targetId, data), { parse_mode: 'HTML' });
-    } catch (err) {
-      console.error('getstats failed:', err.message);
-      await adminReply(ctx, `Failed to fetch stats: ${err.message}`);
-    }
+  const usage = {
+    getstats: '/getstats <user_id>',
+    getbalance: '/getBalance <user_id>',
+    removestars: '/removeStars <user_id>',
+    addstars: '/addstars <user_id> <amount>  (amount can be negative)',
+    addgift: '/addgift <user_id> <gift_name>',
+    addnft: '/addnft <user_id> <type>',
+  };
+  if (!isId(targetId)) {
+    await replyInTopic(ctx, `Usage: ${usage[cmd]}`);
     return;
   }
 
-  if (cmd === 'getbalance') {
-    const targetId = argStr.split(/\s+/)[0];
-    if (!targetId || isNaN(Number(targetId))) {
-      await adminReply(ctx, 'Usage: /getBalance <user_id>');
-      return;
-    }
-    try {
-      const data = await adminGet(`/admin/users/${targetId}/balance?admin_id=${ctx.from.id}`);
+  try {
+    if (cmd === 'getstats') {
+      const data = await adminRequest('GET', `/admin/users/${targetId}/stats?admin_id=${adminId}`);
+      await replyInTopic(ctx, formatStats(targetId, data), { parse_mode: 'HTML' });
+    } else if (cmd === 'getbalance') {
+      const data = await adminRequest('GET', `/admin/users/${targetId}/balance?admin_id=${adminId}`);
       const u = data.user || {};
-      await adminReply(ctx, `💰 Balance for ${targetId}\nCoins: ${u.coins ?? 0}\n⭐ Stars: ${u.stars ?? 0}`);
-    } catch (err) {
-      console.error('getbalance failed:', err.message);
-      await adminReply(ctx, `Failed to fetch balance: ${err.message}`);
-    }
-    return;
-  }
-
-  if (cmd === 'removestars') {
-    const targetId = argStr.split(/\s+/)[0];
-    if (!targetId || isNaN(Number(targetId))) {
-      await adminReply(ctx, 'Usage: /removeStars <user_id>');
-      return;
-    }
-    try {
-      const data = await adminDelete(`/admin/users/${targetId}/stars`, { admin_id: ctx.from.id });
-      await adminReply(ctx, `⭐ Removed all stars from ${targetId}. Previous balance: ${data.previous_stars}. New balance: ${data.stars}`);
-    } catch (err) {
-      console.error('removestars failed:', err.message);
-      await adminReply(ctx, `Failed to remove stars: ${err.message}`);
-    }
-    return;
-  }
-
-  if (cmd === 'addstars') {
-    const [targetId, amountStr] = argStr.split(/\s+/);
-    const amount = parseInt(amountStr, 10);
-    if (!targetId || isNaN(Number(targetId)) || !Number.isFinite(amount) || amount === 0) {
-      await adminReply(ctx, 'Usage: /addstars <user_id> <amount>  (amount can be negative)');
-      return;
-    }
-    try {
-      const data = await adminPost(`/admin/users/${targetId}/stars`, { amount, admin_id: ctx.from.id });
-      await adminReply(ctx, `⭐ ${amount > 0 ? 'Added' : 'Removed'} ${Math.abs(amount)} star(s) for ${targetId}. New balance: ${data.stars}`);
-    } catch (err) {
-      console.error('addstars failed:', err.message);
-      await adminReply(ctx, `Failed to add stars: ${err.message}`);
-    }
-    return;
-  }
-
-  if (cmd === 'addgift') {
-    const parts = argStr.split(/\s+/);
-    const targetId = parts[0];
-    const giftName = parts.slice(1).join(' ').trim();
-    if (!targetId || isNaN(Number(targetId)) || !giftName) {
-      await adminReply(ctx, 'Usage: /addgift <user_id> <gift_name>');
-      return;
-    }
-    try {
-      const data = await adminPost('/admin/gifts', { user_id: targetId, gift_name: giftName, admin_id: ctx.from.id });
-      await adminReply(ctx, `🎁 Added "${giftName}" to ${targetId}'s inventory. Prize ID: ${data.prize.prize_id}`);
-    } catch (err) {
-      console.error('addgift failed:', err.message);
-      await adminReply(ctx, `Failed to add gift: ${err.message}`);
-    }
-    return;
-  }
-
-  if (cmd === 'addnft') {
-    const parts = argStr.split(/\s+/);
-    const targetId = parts[0];
-    const nftType = parts.slice(1).join(' ').trim();
-    if (!targetId || isNaN(Number(targetId)) || !nftType) {
-      await adminReply(ctx, 'Usage: /addnft <user_id> <type>');
-      return;
-    }
-    try {
-      // ASSUMPTION: nft_slug is what the claim/relayer side keys off for NFT
-      // delivery, and gift_name is just the display string shown in the
-      // inventory UI — I set both to the same typed value. I don't have the
-      // gift-relayer's source, so if your NFT slugs follow a different
-      // format (a catalog key vs a free-text name), this is the line to
-      // adjust: `nft_slug: nftType` below.
-      const data = await adminPost('/admin/gifts', {
+      await replyInTopic(ctx, `💰 Balance for ${targetId}\nCoins: ${u.coins ?? 0}\n⭐ Stars: ${u.stars ?? 0}`);
+    } else if (cmd === 'removestars') {
+      const data = await adminRequest('DELETE', `/admin/users/${targetId}/stars`, { admin_id: adminId });
+      await replyInTopic(ctx, `⭐ Removed all stars from ${targetId}. Previous balance: ${data.previous_stars}. New balance: ${data.stars}`);
+    } else if (cmd === 'addstars') {
+      const amount = parseInt(parts[1], 10);
+      if (!Number.isFinite(amount) || amount === 0) {
+        await replyInTopic(ctx, `Usage: ${usage.addstars}`);
+        return;
+      }
+      const data = await adminRequest('POST', `/admin/users/${targetId}/stars`, { amount, admin_id: adminId });
+      await replyInTopic(ctx, `⭐ ${amount > 0 ? 'Added' : 'Removed'} ${Math.abs(amount)} star(s) for ${targetId}. New balance: ${data.stars}`);
+    } else if (cmd === 'addgift') {
+      if (!rest) {
+        await replyInTopic(ctx, `Usage: ${usage.addgift}`);
+        return;
+      }
+      const data = await adminRequest('POST', '/admin/gifts', { user_id: targetId, gift_name: rest, admin_id: adminId });
+      await replyInTopic(ctx, `🎁 Added "${rest}" to ${targetId}'s inventory. Prize ID: ${data.prize.prize_id}`);
+    } else if (cmd === 'addnft') {
+      if (!rest) {
+        await replyInTopic(ctx, `Usage: ${usage.addnft}`);
+        return;
+      }
+      // ASSUMPTION (unchanged): nft_slug and gift_name are both the typed value.
+      const data = await adminRequest('POST', '/admin/gifts', {
         user_id: targetId,
-        gift_name: nftType,
-        nft_slug: nftType,
-        admin_id: ctx.from.id,
+        gift_name: rest,
+        nft_slug: rest,
+        admin_id: adminId,
       });
-      await ctx.reply(`🖼 Added NFT "${nftType}" to ${targetId}'s inventory. Prize ID: ${data.prize.prize_id}`);
-    } catch (err) {
-      console.error('addnft failed:', err.message);
-      await ctx.reply(`Failed to add NFT: ${err.message}`);
+      await replyInTopic(ctx, `🖼 Added NFT "${rest}" to ${targetId}'s inventory. Prize ID: ${data.prize.prize_id}`);
     }
-    return;
+  } catch (err) {
+    console.error(`${cmd} failed:`, err.message);
+    await replyInTopic(ctx, `Command failed: ${err.message}`).catch(() => {});
   }
 });
 
 // ---------------------------------------------------------------------------
-// /pushAnnounce — manager-only global broadcast — new
-//
-//   /pushAnnounce <message>              text-only broadcast
-//   (send a photo, caption it "/pushAnnounce <message>")  photo broadcast
-//
-// grammy matches commands inside photo captions the same way it matches
-// plain command text, and ctx.match is everything after the command with
-// the command itself already stripped — that's the "copy everything
-// excluding the command" part, for both the text and photo case.
-//
-// This is a bot.command() registration, so — like the admin block above —
-// it runs and terminates before the catch-all relay handler further down;
-// a non-manager just gets a rejection reply and nothing gets forwarded
-// anywhere.
+// /pushAnnounce — manager-only global broadcast
 // ---------------------------------------------------------------------------
 bot.command('pushAnnounce', async (ctx) => {
   if (!isManager(ctx.from.id)) {
-    await ctx.reply('🚫 Managers only.');
+    await replyInTopic(ctx, '🚫 Managers only.');
     return;
   }
-
   if (!PUSH_BRIDGE_URL || !PUSH_BRIDGE_SECRET) {
-    await ctx.reply('Broadcast bridge is not configured — missing PUSH_BRIDGE_URL / PUSH_BRIDGE_SECRET.');
+    await replyInTopic(ctx, 'Broadcast bridge is not configured — missing PUSH_BRIDGE_URL / PUSH_BRIDGE_SECRET.');
     return;
   }
 
@@ -483,7 +512,7 @@ bot.command('pushAnnounce', async (ctx) => {
   const photo = ctx.message.photo;
 
   if (!text && !photo) {
-    await ctx.reply('Usage: /pushAnnounce <message>  (optionally attach a photo — caption = command + text)');
+    await replyInTopic(ctx, 'Usage: /pushAnnounce <message>  (optionally attach a photo — caption = command + text)');
     return;
   }
 
@@ -492,105 +521,176 @@ bot.command('pushAnnounce', async (ctx) => {
 
   if (photo) {
     try {
-      // Telegram's `photo` array is sorted smallest -> largest; last entry
-      // is the highest resolution version.
-      const fileId = photo[photo.length - 1].file_id;
+      const fileId = photo[photo.length - 1].file_id; // largest size
       const file = await ctx.api.getFile(fileId);
-      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-      const resp = await fetch(fileUrl);
+      const resp = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`, {
+        signal: AbortSignal.timeout(30000),
+      });
       if (!resp.ok) throw new Error(`Telegram file download failed: HTTP ${resp.status}`);
-      const arrayBuffer = await resp.arrayBuffer();
-      photoBase64 = Buffer.from(arrayBuffer).toString('base64');
-      photoMime = 'image/jpeg'; // Telegram re-encodes photos to jpeg server-side
+      photoBase64 = Buffer.from(await resp.arrayBuffer()).toString('base64');
+      photoMime = 'image/jpeg';
     } catch (err) {
       console.error('pushAnnounce: failed to fetch photo:', err.message);
-      await ctx.reply(`Failed to fetch the photo from Telegram: ${err.message}`);
+      await replyInTopic(ctx, 'Failed to fetch the photo from Telegram. Nothing was sent.');
       return;
     }
   }
 
-  await ctx.reply('📣 Broadcasting…');
+  await replyInTopic(ctx, '📣 Broadcasting…');
 
   try {
     const resp = await fetch(PUSH_BRIDGE_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-push-secret': PUSH_BRIDGE_SECRET },
       body: JSON.stringify({ managerId: ctx.from.id, text, photoBase64, photoMime }),
+      signal: AbortSignal.timeout(5 * 60 * 1000),
     });
     const data = await resp.json().catch(() => ({}));
-    if (!resp.ok || !data.ok) {
-      throw new Error(data.error || `HTTP ${resp.status}`);
-    }
-    await ctx.reply(
-      `✅ Sent to ${data.sent}/${data.total} users. (${data.blocked} blocked the bot, ${data.failed} failed.)`
-    );
+    if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    await replyInTopic(ctx, `✅ Sent to ${data.sent}/${data.total} users. (${data.blocked} blocked the bot, ${data.failed} failed.)`);
   } catch (err) {
     console.error('pushAnnounce: bridge request failed:', err.message);
-    await ctx.reply(`Broadcast failed: ${err.message}`);
+    await replyInTopic(ctx, `Broadcast failed: ${err.message}`);
   }
 });
 
 // ---------------------------------------------------------------------------
-// Relay: user DM <-> topic (must be ONE handler — grammy stops the whole
-// middleware chain if a handler returns without calling next(), so two
-// separate bot.on('message', ...) blocks meant the DM->topic handler's early
-// `return` for group messages silently prevented the topic->DM handler
-// below it from ever running. That's why staff replies never reached users.)
+// Relay (ONE handler — see grammy middleware notes in the original file)
 // ---------------------------------------------------------------------------
-bot.on('message', async (ctx) => {
-  // --- Direction 1: user DM -> topic ---
-  if (ctx.chat.type === 'private') {
-    if (ctx.message.contact) return; // handled above
-    if (ctx.message.text && ctx.message.text.startsWith('/')) return; // commands handled above
+async function relayUserMessage(ctx) {
+  const copy = (ticket) =>
+    ctx.api.copyMessage(SUPPORT_GROUP_ID, ctx.chat.id, ctx.message.message_id, {
+      message_thread_id: ticket.topicId,
+    });
 
-    let ticket;
-    try {
-      ticket = await getOrCreateTicket(ctx.from);
-    } catch (err) {
-      console.error('createForumTopic failed:', err.description || err.message);
-      return;
-    }
+  let ticket = await getOrCreateTicket(ctx.from);
+  try {
+    await copy(ticket);
+    return;
+  } catch (err) {
+    if (!TOPIC_GONE.test(errText(err))) throw err;
+    // Topic was deleted/closed behind our back: retire it and open a fresh one.
+    console.warn(`Topic for ticket #${ticket.ticketNumber} is gone (${errText(err)}); opening a new ticket.`);
+    ticket.closed = true;
+    saveDB();
+  }
+  ticket = await getOrCreateTicket(ctx.from);
+  await copy(ticket);
+}
 
-    try {
-      await bot.api.copyMessage(SUPPORT_GROUP_ID, ctx.chat.id, ctx.message.message_id, {
-        message_thread_id: ticket.topicId,
-      });
-    } catch (err) {
-      console.error('Failed to relay user message:', err.description || err.message);
+const hintedTopics = new Set();
+
+async function relayStaffMessage(ctx) {
+  const m = ctx.message;
+  const topicId = m.message_thread_id;
+  if (!topicId || m.from?.is_bot) return; // ignore "General" and bot messages
+  if (!isRelayable(m)) return; // service messages
+  if ((m.text || m.caption || '').startsWith('/')) return; // commands are never relayed
+
+  const ticket = ticketByTopic(topicId);
+  if (!ticket) {
+    if (!hintedTopics.has(topicId)) {
+      hintedTopics.add(topicId);
+      await replyInTopic(
+        ctx,
+        "⚠️ This topic isn't linked to a user, so nothing was delivered. If it's a ticket topic, the user's ID is in its first message — run /link <user_id> to reconnect it."
+      ).catch(() => {});
     }
     return;
   }
 
-  // --- Direction 2: topic -> user DM (+ /close typed inside a ticket topic) ---
-  if (ctx.chat.id === SUPPORT_GROUP_ID) {
-    if (!ctx.message.message_thread_id) return; // ignore messages in "General"
+  try {
+    await ctx.api.copyMessage(ticket.userId, ctx.chat.id, m.message_id);
+  } catch (err) {
+    const d = errText(err);
+    console.error(`Relay to user ${ticket.userId} failed:`, d);
+    let note;
+    if (/blocked by the user/i.test(d)) note = '🚫 Not delivered — the user has blocked the bot.';
+    else if (/deactivated|chat not found/i.test(d)) note = '🚫 Not delivered — this user account is unavailable.';
+    else note = `⚠️ Not delivered: ${d}`;
+    await ctx
+      .reply(note, { message_thread_id: topicId, reply_parameters: { message_id: m.message_id } })
+      .catch(() => {});
+  }
+}
 
-    const ticket = db.byTopic[ctx.message.message_thread_id];
-    if (!ticket) return;
-
-    if (ctx.message.text === '/close') {
-      ticket.closed = true;
-      saveDB();
-      await bot.api.closeForumTopic(SUPPORT_GROUP_ID, ticket.topicId).catch(() => {});
-      await ctx.reply('Ticket closed.', { message_thread_id: ticket.topicId });
-      await bot.api.sendMessage(
-        ticket.userId,
-        'This support ticket has been closed. Send a new message to start another.'
-      ).catch(() => {});
-      return;
-    }
-
+bot.on('message', async (ctx) => {
+  if (ctx.chat.type === 'private') {
+    if (ctx.message.text && ctx.message.text.startsWith('/')) return; // unknown/handled commands
     try {
-      await bot.api.copyMessage(ticket.userId, ctx.chat.id, ctx.message.message_id);
+      await relayUserMessage(ctx);
     } catch (err) {
-      console.error('Failed to relay staff message (user may have blocked the bot):', err.description || err.message);
+      console.error('Failed to relay user message:', errText(err));
+      await ctx.reply("⚠️ We couldn't deliver your message just now. Please try again in a moment.").catch(() => {});
     }
+    return;
+  }
+
+  if (ctx.chat.id === SUPPORT_GROUP_ID) {
+    await relayStaffMessage(ctx);
   }
 });
 
 bot.catch((err) => {
-  console.error('Unhandled bot error:', err.error?.description || err.error?.message || err);
+  console.error('Unhandled bot error:', errText(err.error));
 });
 
-bot.start();
-console.log('Support bot running.');
+// ---------------------------------------------------------------------------
+// Startup / shutdown
+// ---------------------------------------------------------------------------
+async function checkSetup() {
+  try {
+    const chat = await bot.api.getChat(SUPPORT_GROUP_ID);
+    if (!chat.is_forum) console.warn('⚠️  SUPPORT_GROUP_ID is not a forum (Topics are not enabled).');
+    const me = await bot.api.getChatMember(SUPPORT_GROUP_ID, bot.botInfo.id);
+    if (me.status !== 'administrator') {
+      console.warn('⚠️  Bot is not an admin in the support group.');
+    } else if (!me.can_manage_topics) {
+      console.warn('⚠️  Bot is admin but lacks the "Manage topics" permission.');
+    }
+  } catch (err) {
+    console.warn('⚠️  Could not verify the support group:', errText(err));
+  }
+}
+
+let stopping = false;
+function shutdown(signal) {
+  if (stopping) return;
+  stopping = true;
+  console.log(`[shutdown] ${signal} received, stopping polling…`);
+  setTimeout(() => process.exit(0), 5000).unref();
+  Promise.resolve(bot.stop()).finally(() => process.exit(0));
+}
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+
+process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', errText(err)));
+
+async function main() {
+  while (!stopping) {
+    try {
+      await bot.start({
+        onStart: (me) => {
+          console.log(`Support bot running as @${me.username}`);
+          checkSetup();
+        },
+      });
+      return; // stopped on purpose
+    } catch (err) {
+      if (stopping) return;
+      const conflict = err?.error_code === 409;
+      console.error(
+        conflict
+          ? '[poll] 409 Conflict: another instance is polling this BOT_TOKEN. Retrying in 15s…'
+          : `[poll] polling stopped: ${errText(err)}. Retrying in 5s…`
+      );
+      await new Promise((r) => setTimeout(r, conflict ? 15000 : 5000));
+    }
+  }
+}
+
+if (require.main === module) {
+  main();
+} else {
+  module.exports = { migrate };
+}
