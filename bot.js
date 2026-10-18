@@ -51,17 +51,17 @@ const bot = new Bot(BOT_TOKEN);
 // topic. New format: ONE record per ticket, plus two index maps that only
 // store ticket numbers.
 //
-//   { nextTicketNumber, tickets: {num: ticket}, byUser: {userId: num}, byTopic: {topicId: num} }
+//   { nextTicketNumber, tickets: {num: ticket}, byUser: {userId: num}, byTopic: {topicId: num}, users: {userId: {lang}} }
 // ---------------------------------------------------------------------------
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function emptyDB() {
-  return { nextTicketNumber: 1, tickets: {}, byUser: {}, byTopic: {} };
+  return { nextTicketNumber: 1, tickets: {}, byUser: {}, byTopic: {}, users: {} };
 }
 
 function migrate(raw) {
   if (raw && raw.tickets) {
-    return { ...emptyDB(), ...raw };
+    return { ...emptyDB(), ...raw, users: raw.users || {} };
   }
   // Legacy format -> new format
   const db = emptyDB();
@@ -70,7 +70,7 @@ function migrate(raw) {
   for (const t of legacy) {
     const prev = db.tickets[t.ticketNumber];
     db.tickets[t.ticketNumber] = prev
-      ? { ...prev, ...t, closed: Boolean(prev.closed || t.closed), phone: t.phone || prev.phone || null }
+      ? { ...prev, ...t, closed: Boolean(prev.closed || t.closed) }
       : { ...t };
   }
   const nums = Object.keys(db.tickets).map(Number).sort((a, b) => a - b);
@@ -137,6 +137,181 @@ const isRelayable = (m) => RELAYABLE.some((k) => m[k] !== undefined);
 const TOPIC_GONE = /thread not found|TOPIC_DELETED|TOPIC_CLOSED|topic.*(deleted|closed)/i;
 
 // ---------------------------------------------------------------------------
+// Languages & help categories
+// ---------------------------------------------------------------------------
+// Players pick a language once (stored per user). Everything the PLAYER sees —
+// menus, buttons, tips, confirmations and the bot's command list — comes from
+// I18N below. Anything the STAFF sees (info cards, /close, errors) stays English.
+// To add a language: add it to LANGS, I18N and COMMANDS.
+// ---------------------------------------------------------------------------
+const DEFAULT_LANG = 'en';
+const LANGS = { en: '🇬🇧 English', ru: '🇷🇺 Русский' };
+const CATEGORY_IDS = ['gift', 'stars', 'sub', 'nft', 'payment'];
+const STAFF_CATEGORY = {
+  gift: "Gift wasn't claimed",
+  stars: 'Stars balance not received',
+  sub: 'Subscription check trouble',
+  nft: 'NFT gift question',
+  payment: 'Payment problem',
+  other: 'Other question',
+};
+
+const I18N = {
+  en: {
+    pick_language: 'Please choose your language / Пожалуйста, выберите язык',
+    lang_saved: 'Language: English',
+    menu_title: 'Hi! 👋 How can we help?\nPick a topic below.',
+    btn_language: '🌐 Language',
+    btn_contact: '📩 Contact support',
+    btn_back: '⬅️ Back',
+    cat_gift: "🎁 Gift wasn't claimed",
+    cat_stars: "⭐ Stars balance isn't received",
+    cat_sub: '✅ Subscription check trouble',
+    cat_nft: '🖼 NFT gift question',
+    cat_payment: '💳 Payment problem',
+    cat_other: '❓ Other question',
+    tip_gift:
+      "<b>🎁 Gift wasn't claimed</b>\n\n" +
+      '• Make sure you tapped “Claim Prize” in the app and saw the confirmation.\n' +
+      '• Gifts come from @VoidGift_Relayer. If you have never opened that chat, open it, press Start, then claim again.\n' +
+      '• Check that your Telegram privacy settings allow receiving gifts.\n' +
+      '• Regular gifts arrive within minutes. NFT gifts are delivered within 48 hours.\n\n' +
+      'Still nothing? Contact support and include your Prize ID.',
+    tip_stars:
+      "<b>⭐ Stars balance isn't received</b>\n\n" +
+      '• Close and reopen the Mini App — purchased Stars are added when it loads.\n' +
+      '• Wait about a minute and try again.\n' +
+      '• Keep the payment receipt from Telegram.\n\n' +
+      'Still missing? Contact support and send the receipt or Charge ID.',
+    tip_sub:
+      '<b>✅ Subscription check trouble</b>\n\n' +
+      '• Join our channel @VoidGiftsOfficial (opening it is not enough — press Join).\n' +
+      '• Go back to the app and tap OK.\n' +
+      '• Already joined? Wait 10 seconds and tap OK again, or restart the app.\n\n' +
+      'Still failing? Contact support — we can verify you manually.',
+    tip_nft:
+      '<b>🖼 NFT gift question</b>\n\n' +
+      '• Every NFT claim needs a fresh top-up of at least 25 Stars.\n' +
+      '• After you claim, the NFT is transferred within 48 hours from @VoidGift_Relayer. Open that chat and press Start so it can reach you.\n' +
+      '• You can follow the countdown in your Inventory.\n\n' +
+      'Something wrong? Contact support and include your Prize ID.',
+    tip_payment:
+      '<b>💳 Payment problem</b>\n\n' +
+      '• If Telegram charged you but nothing arrived, restart the app first.\n' +
+      '• Keep the payment receipt.\n\n' +
+      'Then contact support and send the receipt or Charge ID.',
+    connected: "You're connected to support. Describe your problem in one message and we'll reply here.",
+    ticket_closed: 'This support ticket has been closed. Use /start to open a new one.',
+    support_down: 'Support is temporarily unavailable, please try again shortly.',
+    relay_failed: "⚠️ We couldn't deliver your message just now. Please try again in a moment.",
+  },
+  ru: {
+    pick_language: 'Please choose your language / Пожалуйста, выберите язык',
+    lang_saved: 'Язык: Русский',
+    menu_title: 'Привет! 👋 Чем помочь?\nВыберите тему ниже.',
+    btn_language: '🌐 Язык',
+    btn_contact: '📩 Написать в поддержку',
+    btn_back: '⬅️ Назад',
+    cat_gift: '🎁 Подарок не пришёл',
+    cat_stars: '⭐ Stars не зачислены',
+    cat_sub: '✅ Проблема с проверкой подписки',
+    cat_nft: '🖼 Вопрос по NFT-подарку',
+    cat_payment: '💳 Проблема с оплатой',
+    cat_other: '❓ Другой вопрос',
+    tip_gift:
+      '<b>🎁 Подарок не пришёл</b>\n\n' +
+      '• Убедитесь, что нажали «Забрать» в приложении и увидели подтверждение.\n' +
+      '• Подарки приходят от @VoidGift_Relayer. Если вы ни разу не открывали этот чат — откройте его, нажмите Start и снова заберите подарок.\n' +
+      '• Проверьте, что в настройках приватности Telegram разрешено получать подарки.\n' +
+      '• Обычные подарки приходят в течение нескольких минут. NFT-подарки доставляются в течение 48 часов.\n\n' +
+      'Всё равно не пришло? Напишите в поддержку и укажите Prize ID.',
+    tip_stars:
+      '<b>⭐ Stars не зачислены</b>\n\n' +
+      '• Закройте и снова откройте мини-приложение — купленные Stars добавляются при загрузке.\n' +
+      '• Подождите около минуты и попробуйте ещё раз.\n' +
+      '• Сохраните чек об оплате из Telegram.\n\n' +
+      'Не появились? Напишите в поддержку и пришлите чек или Charge ID.',
+    tip_sub:
+      '<b>✅ Проблема с проверкой подписки</b>\n\n' +
+      '• Вступите в наш канал @VoidGiftsOfficial (просто открыть мало — нажмите «Подписаться»).\n' +
+      '• Вернитесь в приложение и нажмите OK.\n' +
+      '• Уже подписаны? Подождите 10 секунд и нажмите OK ещё раз или перезапустите приложение.\n\n' +
+      'Не помогло? Напишите в поддержку — мы проверим вас вручную.',
+    tip_nft:
+      '<b>🖼 Вопрос по NFT-подарку</b>\n\n' +
+      '• Для каждого NFT нужно новое пополнение минимум на 25 Stars.\n' +
+      '• После получения NFT переводится в течение 48 часов от @VoidGift_Relayer. Откройте этот чат и нажмите Start, чтобы он мог вам написать.\n' +
+      '• Обратный отсчёт виден в Инвентаре.\n\n' +
+      'Что-то не так? Напишите в поддержку и укажите Prize ID.',
+    tip_payment:
+      '<b>💳 Проблема с оплатой</b>\n\n' +
+      '• Если Telegram списал оплату, но ничего не пришло — сначала перезапустите приложение.\n' +
+      '• Сохраните чек об оплате.\n\n' +
+      'Затем напишите в поддержку и пришлите чек или Charge ID.',
+    connected: 'Вы подключены к поддержке. Опишите проблему одним сообщением — мы ответим здесь.',
+    ticket_closed: 'Обращение закрыто. Нажмите /start, чтобы открыть новое.',
+    support_down: 'Поддержка временно недоступна, попробуйте чуть позже.',
+    relay_failed: '⚠️ Не удалось доставить ваше сообщение. Попробуйте ещё раз через минуту.',
+  },
+};
+
+const COMMANDS = {
+  en: [
+    { command: 'start', description: 'Open the help menu' },
+    { command: 'createticket', description: 'Contact support' },
+    { command: 'language', description: 'Change language' },
+  ],
+  ru: [
+    { command: 'start', description: 'Открыть меню помощи' },
+    { command: 'createticket', description: 'Связаться с поддержкой' },
+    { command: 'language', description: 'Сменить язык' },
+  ],
+};
+
+const t = (lang, key) => (I18N[lang] || I18N[DEFAULT_LANG])[key] ?? I18N[DEFAULT_LANG][key] ?? key;
+const langOf = (userId) => db.users[userId]?.lang || null;
+const langOrDefault = (userId) => langOf(userId) || DEFAULT_LANG;
+
+function setLang(userId, lang) {
+  db.users[userId] = { ...(db.users[userId] || {}), lang };
+  saveDB();
+}
+
+function languageKeyboard() {
+  const kb = new InlineKeyboard();
+  for (const [code, label] of Object.entries(LANGS)) kb.text(label, `lang:${code}`);
+  return kb;
+}
+
+function menuKeyboard(lang) {
+  const kb = new InlineKeyboard();
+  for (const id of CATEGORY_IDS) kb.text(t(lang, `cat_${id}`), `cat:${id}`).row();
+  kb.text(t(lang, 'cat_other'), 'cat:other').row();
+  kb.text(t(lang, 'btn_language'), 'langmenu');
+  return kb;
+}
+
+// Telegram shows the command list per language; also pin the chosen language
+// for this particular chat so "/" shows the right descriptions even if their
+// Telegram app language is different. Best effort — never blocks the flow.
+async function applyCommandsFor(userId, lang) {
+  try {
+    await bot.api.setMyCommands(COMMANDS[lang] || COMMANDS[DEFAULT_LANG], { scope: { type: 'chat', chat_id: userId } });
+  } catch (err) {
+    console.warn('setMyCommands(chat) failed:', errText(err));
+  }
+}
+
+async function registerCommands() {
+  try {
+    await bot.api.setMyCommands(COMMANDS.en, { scope: { type: 'all_private_chats' } });
+    await bot.api.setMyCommands(COMMANDS.ru, { scope: { type: 'all_private_chats' }, language_code: 'ru' });
+  } catch (err) {
+    console.warn('setMyCommands failed:', errText(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tickets
 // ---------------------------------------------------------------------------
 async function sendInfoCard(ticket, user) {
@@ -145,7 +320,8 @@ async function sendInfoCard(ticket, user) {
     `👤 Name: ${escapeHtml(fullName(user))}`,
     `🔗 Username: ${user.username ? '@' + escapeHtml(user.username) : '—'}`,
     `🆔 ID: <code>${user.id}</code>`,
-    `📞 Phone (optional): ${ticket.phone ? escapeHtml(ticket.phone) : 'not shared'}`,
+    `🏷 Topic: ${escapeHtml(STAFF_CATEGORY[ticket.category] || STAFF_CATEGORY.other)}`,
+    `🌐 Language: ${escapeHtml(LANGS[langOf(user.id)] || LANGS[DEFAULT_LANG])}`,
     `💬 Contact: <a href="${userLink(user)}">open chat</a>`,
   ].join('\n');
 
@@ -156,8 +332,7 @@ async function sendInfoCard(ticket, user) {
   });
 }
 
-async function createTicket(user) {
-  const prev = latestTicketFor(user.id);
+async function createTicket(user, category = 'other') {
   const ticketNumber = db.nextTicketNumber;
   const title = `#${ticketNumber} · ${fullName(user)}`.slice(0, 128);
 
@@ -170,7 +345,7 @@ async function createTicket(user) {
     topicId: topic.message_thread_id,
     userId: user.id,
     closed: false,
-    phone: prev?.phone || null,
+    category,
     createdAt: Date.now(),
   };
   db.tickets[ticketNumber] = ticket;
@@ -186,11 +361,11 @@ async function createTicket(user) {
 // One ticket creation per user at a time, so two quick messages can't spawn
 // two topics.
 const creating = new Map();
-function getOrCreateTicket(user) {
+function getOrCreateTicket(user, category = 'other') {
   const open = openTicketFor(user.id);
   if (open) return Promise.resolve(open);
   if (creating.has(user.id)) return creating.get(user.id);
-  const p = createTicket(user).finally(() => creating.delete(user.id));
+  const p = createTicket(user, category).finally(() => creating.delete(user.id));
   creating.set(user.id, p);
   return p;
 }
@@ -200,34 +375,32 @@ async function closeTicket(ticket, { notifyUser = true } = {}) {
   ticket.closed = true;
   saveDB();
   if (notifyUser) {
-    await bot.api
-      .sendMessage(ticket.userId, 'This support ticket has been closed. Send a new message to start another.')
-      .catch(() => {});
+    await bot.api.sendMessage(ticket.userId, t(langOrDefault(ticket.userId), 'ticket_closed')).catch(() => {});
   }
   return true;
 }
 
-async function startTicketFlow(chatId, user) {
+async function startTicketFlow(chatId, user, category = 'other') {
+  const lang = langOrDefault(user.id);
+  let ticket;
   try {
-    await getOrCreateTicket(user);
+    ticket = await getOrCreateTicket(user, category);
   } catch (err) {
     console.error('createForumTopic failed:', errText(err));
-    await bot.api.sendMessage(chatId, 'Support is temporarily unavailable, please try again shortly.').catch(() => {});
+    await bot.api.sendMessage(chatId, t(lang, 'support_down')).catch(() => {});
     return;
   }
 
-  const keyboard = new Keyboard()
-    .requestContact('📞 Share phone number (optional)')
-    .row()
-    .text('⏭ Skip')
-    .resized()
-    .oneTime();
+  // Already had an open ticket and picked a different topic now: tell staff.
+  if (ticket.category !== category && category !== 'other') {
+    ticket.category = category;
+    saveDB();
+    await bot.api
+      .sendMessage(SUPPORT_GROUP_ID, `🏷 Topic updated: ${STAFF_CATEGORY[category]}`, { message_thread_id: ticket.topicId })
+      .catch(() => {});
+  }
 
-  await bot.api.sendMessage(
-    chatId,
-    "You're connected to support. Send your message and we'll reply here.\n\nSharing your phone number is optional — tap Skip if you'd rather not.",
-    { reply_markup: keyboard }
-  );
+  await bot.api.sendMessage(chatId, t(lang, 'connected'), { reply_markup: { remove_keyboard: true } });
 }
 
 // ---------------------------------------------------------------------------
@@ -235,53 +408,96 @@ async function startTicketFlow(chatId, user) {
 // ---------------------------------------------------------------------------
 const isPrivate = (ctx) => ctx.chat?.type === 'private';
 
+async function showLanguagePicker(chatId) {
+  await bot.api.sendMessage(chatId, t(DEFAULT_LANG, 'pick_language'), { reply_markup: languageKeyboard() });
+}
+
+// Shows the help menu — or the language picker first if they haven't chosen.
+async function showMenuOrPicker(chatId, userId) {
+  const lang = langOf(userId);
+  if (!lang) return showLanguagePicker(chatId);
+  await bot.api.sendMessage(chatId, t(lang, 'menu_title'), { reply_markup: menuKeyboard(lang) });
+}
+
 bot.command('start', async (ctx) => {
   if (!isPrivate(ctx)) return;
-  const keyboard = new InlineKeyboard().text('📩 Contact Support', 'open_ticket');
-  await ctx.reply('Need help? Tap below to talk to support.', { reply_markup: keyboard });
+  await showMenuOrPicker(ctx.chat.id, ctx.from.id);
+});
+
+bot.command('help', async (ctx) => {
+  if (!isPrivate(ctx)) return;
+  await showMenuOrPicker(ctx.chat.id, ctx.from.id);
+});
+
+bot.command('language', async (ctx) => {
+  if (!isPrivate(ctx)) return;
+  await showLanguagePicker(ctx.chat.id);
+});
+
+// "Create a ticket" also asks for the language first when it isn't known,
+// then shows the topic menu (every topic ends in a "Contact support" button).
+bot.command('createticket', async (ctx) => {
+  if (!isPrivate(ctx)) return;
+  await showMenuOrPicker(ctx.chat.id, ctx.from.id);
 });
 
 bot.command(DEV_COMMAND, async (ctx) => {
   if (!isPrivate(ctx)) return;
-  await startTicketFlow(ctx.chat.id, ctx.from);
+  if (!langOf(ctx.from.id)) return showLanguagePicker(ctx.chat.id);
+  await startTicketFlow(ctx.chat.id, ctx.from, 'other');
 });
 
-bot.command('createticket', async (ctx) => {
-  if (!isPrivate(ctx)) return;
-  await startTicketFlow(ctx.chat.id, ctx.from);
+// Language chosen -> remember it, switch the command list, show the menu.
+bot.callbackQuery(/^lang:(\w+)$/, async (ctx) => {
+  if (ctx.chat && !isPrivate(ctx)) return ctx.answerCallbackQuery().catch(() => {});
+  const lang = ctx.match[1];
+  if (!LANGS[lang]) return ctx.answerCallbackQuery().catch(() => {});
+  setLang(ctx.from.id, lang);
+  await ctx.answerCallbackQuery({ text: t(lang, 'lang_saved') }).catch(() => {});
+  await ctx.editMessageText(t(lang, 'menu_title'), { reply_markup: menuKeyboard(lang) }).catch(() => {});
+  applyCommandsFor(ctx.from.id, lang);
 });
 
+bot.callbackQuery('langmenu', async (ctx) => {
+  await ctx.answerCallbackQuery().catch(() => {});
+  await ctx.editMessageText(t(DEFAULT_LANG, 'pick_language'), { reply_markup: languageKeyboard() }).catch(() => {});
+});
+
+bot.callbackQuery('menu', async (ctx) => {
+  await ctx.answerCallbackQuery().catch(() => {});
+  const lang = langOf(ctx.from.id);
+  if (!lang) return showLanguagePicker(ctx.from.id);
+  await ctx.editMessageText(t(lang, 'menu_title'), { reply_markup: menuKeyboard(lang) }).catch(() => {});
+});
+
+// A help topic: show the self-help tip with "Contact support" / "Back".
+// "Other question" has no tip — it goes straight to support.
+bot.callbackQuery(/^cat:(\w+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery().catch(() => {});
+  if (ctx.chat && !isPrivate(ctx)) return;
+  const id = ctx.match[1];
+  const lang = langOrDefault(ctx.from.id);
+
+  if (id === 'other') return startTicketFlow(ctx.from.id, ctx.from, 'other');
+  if (!CATEGORY_IDS.includes(id)) return;
+
+  const kb = new InlineKeyboard().text(t(lang, 'btn_contact'), `ticket:${id}`).row().text(t(lang, 'btn_back'), 'menu');
+  await ctx.editMessageText(t(lang, `tip_${id}`), { parse_mode: 'HTML', reply_markup: kb }).catch(() => {});
+});
+
+bot.callbackQuery(/^ticket:(\w+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery().catch(() => {});
+  if (ctx.chat && !isPrivate(ctx)) return;
+  const id = ctx.match[1];
+  await startTicketFlow(ctx.from.id, ctx.from, CATEGORY_IDS.includes(id) ? id : 'other');
+});
+
+// Old "Contact Support" buttons from earlier versions of this bot still
+// sitting in people's chats.
 bot.callbackQuery('open_ticket', async (ctx) => {
   await ctx.answerCallbackQuery().catch(() => {});
   if (ctx.chat && !isPrivate(ctx)) return;
-  await startTicketFlow(ctx.from.id, ctx.from);
-});
-
-bot.hears('⏭ Skip', async (ctx) => {
-  if (!isPrivate(ctx)) return;
-  await ctx.reply('No problem — support can still reach you without a phone number.', {
-    reply_markup: { remove_keyboard: true },
-  });
-});
-
-// Phone number: only ever arrives if the user taps the share-contact button.
-bot.on('message:contact', async (ctx, next) => {
-  if (!isPrivate(ctx)) return next();
-  const ticket = openTicketFor(ctx.from.id);
-  // Someone else's contact, or no open ticket -> treat as a normal message.
-  if (!ticket || ctx.message.contact.user_id !== ctx.from.id) return next();
-
-  ticket.phone = ctx.message.contact.phone_number;
-  saveDB();
-
-  await bot.api
-    .sendMessage(SUPPORT_GROUP_ID, `📞 Phone number shared: <code>${escapeHtml(ticket.phone)}</code>`, {
-      message_thread_id: ticket.topicId,
-      parse_mode: 'HTML',
-    })
-    .catch((err) => console.error('phone notice failed:', errText(err)));
-
-  await ctx.reply('Thanks — support has your number now.', { reply_markup: { remove_keyboard: true } });
+  await showMenuOrPicker(ctx.from.id, ctx.from.id);
 });
 
 // ---------------------------------------------------------------------------
@@ -322,7 +538,7 @@ bot.command('link', async (ctx) => {
     ticket.closed = false;
   } else {
     const ticketNumber = db.nextTicketNumber++;
-    ticket = { ticketNumber, topicId, userId, closed: false, phone: null, createdAt: Date.now(), relinked: true };
+    ticket = { ticketNumber, topicId, userId, closed: false, category: 'other', createdAt: Date.now(), relinked: true };
     db.tickets[ticketNumber] = ticket;
     db.byTopic[topicId] = ticketNumber;
   }
@@ -389,6 +605,7 @@ function formatStats(userId, data) {
   const lines = [
     `<b>Stats for ${escapeHtml(String(userId))}</b>`,
     `Coins: ${u.coins ?? 0}   ⭐ Stars: ${u.stars ?? 0}`,
+    `Subscription: ${u.subscription_override ? '✅ manually set (override)' : 'checked normally'}`,
     `Gifts (${prizes.length}): ${escapeHtml(countsLine)}`,
     '',
   ];
@@ -421,7 +638,7 @@ bot.on('message:text', async (ctx, next) => {
   if (ctx.chat.type !== 'private' && !inSupportGroup) return next();
   if (!isAdmin(ctx.from.id)) return next();
 
-  const match = ctx.message.text.match(/^\/(addstars|removestars|addnft|addgift|getstats|getbalance)(?:@\w+)?(?:\s+([\s\S]+))?$/i);
+  const match = ctx.message.text.match(/^\/(addstars|removestars|addnft|addgift|getstats|getbalance|setsub|grantnft)(?:@\w+)?(?:\s+([\s\S]+))?$/i);
   if (!match) return next();
 
   if (!PRIZE_STORE_URL || !ADMIN_API_KEY) {
@@ -443,6 +660,8 @@ bot.on('message:text', async (ctx, next) => {
     addstars: '/addstars <user_id> <amount>  (amount can be negative)',
     addgift: '/addgift <user_id> <gift_name>',
     addnft: '/addnft <user_id> <type>',
+    grantnft: '/grantnft <user_id> [count]   (gives free NFT-claim unlocks, normally earned by a 25+ Stars top-up)',
+    setsub: '/setsub <user_id> [true|false]   (true = mark as subscribed, false = remove the manual flag; default true)',
   };
   if (!isId(targetId)) {
     await replyInTopic(ctx, `Usage: ${usage[cmd]}`);
@@ -468,6 +687,28 @@ bot.on('message:text', async (ctx, next) => {
       }
       const data = await adminRequest('POST', `/admin/users/${targetId}/stars`, { amount, admin_id: adminId });
       await replyInTopic(ctx, `⭐ ${amount > 0 ? 'Added' : 'Removed'} ${Math.abs(amount)} star(s) for ${targetId}. New balance: ${data.stars}`);
+    } else if (cmd === 'grantnft') {
+      const count = parts[1] ? parseInt(parts[1], 10) : 1;
+      if (!Number.isFinite(count) || count < 1 || count > 20) {
+        await replyInTopic(ctx, `Usage: ${usage.grantnft}`);
+        return;
+      }
+      const data = await adminRequest('POST', `/admin/users/${targetId}/nft-credits`, { count, admin_id: adminId });
+      await replyInTopic(ctx, `🖼 Granted ${data.granted} NFT unlock(s) to ${targetId}. Available now: ${data.available}`);
+    } else if (cmd === 'setsub') {
+      const flag = (parts[1] || 'true').toLowerCase();
+      if (!['true', 'false', 'on', 'off', '1', '0'].includes(flag)) {
+        await replyInTopic(ctx, `Usage: ${usage.setsub}`);
+        return;
+      }
+      const subscribed = ['true', 'on', '1'].includes(flag);
+      await adminRequest('POST', `/admin/users/${targetId}/subscription`, { subscribed, admin_id: adminId });
+      await replyInTopic(
+        ctx,
+        subscribed
+          ? `✅ ${targetId} is now marked as subscribed — the channel check is skipped for them (takes effect within ~30s).`
+          : `↩️ Manual subscription flag removed for ${targetId} — they're checked against the channel again.`
+      );
     } else if (cmd === 'addgift') {
       if (!rest) {
         await replyInTopic(ctx, `Usage: ${usage.addgift}`);
@@ -621,7 +862,7 @@ bot.on('message', async (ctx) => {
       await relayUserMessage(ctx);
     } catch (err) {
       console.error('Failed to relay user message:', errText(err));
-      await ctx.reply("⚠️ We couldn't deliver your message just now. Please try again in a moment.").catch(() => {});
+      await ctx.reply(t(langOrDefault(ctx.from.id), 'relay_failed')).catch(() => {});
     }
     return;
   }
@@ -673,6 +914,7 @@ async function main() {
         onStart: (me) => {
           console.log(`Support bot running as @${me.username}`);
           checkSetup();
+          registerCommands();
         },
       });
       return; // stopped on purpose
@@ -692,5 +934,5 @@ async function main() {
 if (require.main === module) {
   main();
 } else {
-  module.exports = { migrate };
+  module.exports = { migrate, bot, db };
 }
